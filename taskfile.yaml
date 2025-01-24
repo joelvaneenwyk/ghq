@@ -1,0 +1,278 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+# https://taskfile.dev
+
+version: "3"
+
+vars:
+  SQLCIPHER_RELEASE_TAG: v4.5.7
+
+  VCPKG_BOOTSTRAP_BAT: "{{.TASKFILE_DIR}}/external/vcpkg/bootstrap-vcpkg.bat"
+  VCPKG_BOOTSTRAP_SH: "{{.TASKFILE_DIR}}/external/vcpkg/bootstrap-vcpkg.sh"
+  VCPKG_EXE: "{{.TASKFILE_DIR}}/external/vcpkg/vcpkg.exe"
+
+  RUN_WINDOWS: 'cmd /d /c'
+  RUN_UNIX: 'sh -c'
+  RUN: '{{if eq OS "windows"}}{{.RUN_WINDOWS}}{{ else }}{{.RUN_UNIX}}{{ end }}'
+
+  EXE: >-
+    {{if eq OS "windows"}}
+    dist/ghq_windows_amd64_v1/ghq.exe
+    {{else}}
+    dist/ghq_darwin_amd64_v1/ghq
+    {{end}}
+
+  MSBUILD_EXE_RAW:
+    sh: |
+      strings=("Preview" "Enterprise" "Professional" "Community")
+      for str in "${strings[@]}"
+      do
+        result="C:/Program Files/Microsoft Visual Studio/2022/${str}/MSBuild/Current/Bin/amd64/MSBuild.exe"
+        if [ -e "$result" ]; then
+          echo "$result"
+          break
+        fi
+      done
+  MSBUILD_EXE: '{{fromSlash .MSBUILD_EXE_RAW}}'
+  GORELEASER: 'goreleaser'
+
+  BUILD_DIR: .build
+
+env:
+  VCPKG_DISABLE_METRICS: 1
+  CGO_ENABLED: 1
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  rebuild:
+    cmds:
+      - task: clean
+      - task: build
+
+  clean:
+    cmds:
+      - task: delete
+        vars: { TARGET_DIR: '{{.BUILD_DIR}}' }
+
+  build:
+    deps: [sqlcipher, goreleaser-install]
+    preconditions:
+      - '"{{ fromSlash .GORELEASER }}" --version'
+    sources:
+      - .goreleaser.yaml
+      - cmd/**/*.go
+      - pkg/**/*.go
+      - go.mod
+      - go.sum
+      - main.go
+    generates:
+      - dist/**
+    vars:
+      PATH_SEP: '{{if eq OS "windows"}};{{ else }}:{{ end }}'
+      PATH_HOME: '{{ coalesce .USERPROFILE .HOME "" }}'
+      PATH_GO: '{{ joinPath .PATH_HOME "go" "bin" | fromSlash }}'
+      PATH_MINGW: '{{ joinPath .PATH_HOME ".local" "msys64" "mingw64" "bin" | fromSlash }}'
+      PATH_ARRAY: |
+        {{.PATH_GO}}
+        {{.PATH_MINGW}}
+      NEW_PATH: '{{ splitList "\n" .PATH_ARRAY | join .PATH_SEP }}'
+    cmds:
+      - cmd: | # shell
+          PATH="{{.NEW_PATH}}{{.PATH_SEP}}${PATH:-}"
+          goreleaser build --single-target --snapshot --clean
+        set:
+          - nounset
+
+  run: 
+    deps: [build]
+    vars:
+      GHQ_BIN_WIN: ghq_windows_amd64_v1
+      GHQ_BIN_LINUX: ghq_linux_v1
+      GHQ_BIN: >-
+        dist/{{if eq OS "windows"}}{{.GHQ_BIN_WIN}}{{else}}{{.GHQ_BIN_LINUX}}{{end}}/ghq{{exeExt}}
+    cmds:
+      - cmd: |
+          "{{joinPath .TASKFILE_DIR .GHQ_BIN | toSlash}}" {{.CLI_ARGS}}
+        
+  deps:
+    cmds:
+      - cmd: sudo apt-get install gcc-mingw-w64-i686
+      - cmd: sudo apt-get install gcc-mingw-w64-x86-64
+      - cmd: |
+          GOOS=windows GOARCH=386 CGO_ENABLED=1 CC=i686-w64-mingw32-gcc \
+            go build \
+              -buildmode=c-shared -o main.dll main.go
+      - cmd: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
+            go build -buildmode=c-shared -o main.dll main.go
+
+  cross-build:
+    cmds:
+      - cmd: | # shell
+          PRIVATE_KEY=
+          GO_BUILDER_VERSION=v1.17.1
+          docker run --rm --privileged \
+            -e PRIVATE_KEY=$PRIVATE_KEY \
+            -v "{{.TASKFILE_DIR}}":/golang-cross-example \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $GOPATH/src:/go/src \
+            -w /golang-cross-example \
+            ghcr.io/gythialy/golang-cross:$GO_BUILDER_VERSION --snapshot --rm-dist
+
+  sqlcipher:
+    deps: [sqlcipher-compile]
+    platforms: [linux, darwin]
+    sources:
+      - '{{.BUILD_DIR}}/bld/sqlite3.c'
+      - '{{.BUILD_DIR}}/bld/sqlite3.h'
+    generates:
+      - pkg/sqlcipher/sqlite3.c
+      - pkg/sqlcipher/sqlite3.h
+    cmds:
+      - cmd: cp -f {{.BUILD_DIR}}/bld/sqlite3.[ch] pkg/sqlcipher/
+
+  sqlcipher-clone:
+    deps: [git-submodule-init]
+    status:
+      - test -f {{.BUILD_DIR}}/sqlcipher/.git/index
+      - test -f {{.BUILD_DIR}}/sqlcipher/.gitignore
+    generates:
+      - '{{.BUILD_DIR}}/sqlcipher/.git/index'
+      - '{{.BUILD_DIR}}/sqlcipher/.gitignore'
+    cmds:
+      - cmd: mkdir -p "{{ joinPath .TASKFILE_DIR .BUILD_DIR }}"
+      - cmd: |
+          if [ ! -d "{{ joinPath .TASKFILE_DIR .BUILD_DIR "sqlcipher" }}" ]; then
+            git clone \
+              -b "{{.SQLCIPHER_RELEASE_TAG}}" \
+              https://github.com/sqlcipher/sqlcipher.git \
+              "{{ joinPath .TASKFILE_DIR .BUILD_DIR "sqlcipher" }}"
+          fi
+
+  sqlcipher-patched:
+    deps: [sqlcipher-clone]
+    sources:
+      - pkg/sqlcipher/sqlcipher.diff
+    generates:
+      - '{{.BUILD_DIR}}/sqlcipher/Makefile.in'
+      - '{{.BUILD_DIR}}/sqlcipher/src/crypto.h'
+      - '{{.BUILD_DIR}}/sqlcipher/src/crypto_go.c'
+      - '{{.BUILD_DIR}}/sqlcipher/src/crypto_impl.c'
+      - '{{.BUILD_DIR}}/sqlcipher/tool/mksqlite3c.tcl'
+    cmds:
+      - cmd: |
+          git -C "{{ joinPath .TASKFILE_DIR .BUILD_DIR "sqlcipher" }}" clean -xfd
+      - cmd: |
+          git -C "{{ joinPath .TASKFILE_DIR .BUILD_DIR "sqlcipher" }}" reset --hard "{{.SQLCIPHER_RELEASE_TAG}}"
+      - cmd: |
+          patch \
+            --directory="{{ joinPath .TASKFILE_DIR .BUILD_DIR "sqlcipher" }}" \
+            --verbose \
+            --strip=0 \
+            --batch \
+            -i "{{ joinPath .TASKFILE_DIR "pkg" "sqlcipher" "sqlcipher.diff" }}"
+
+  sqlcipher-configure:
+    deps: [sqlcipher-patched]
+    sources:
+      - '{{.BUILD_DIR}}/sqlcipher/configure'
+    generates:
+      - '{{.BUILD_DIR}}/bld/Makefile'
+    status:
+      - test -f "{{.BUILD_DIR}}/bld/Makefile"
+    vars:
+      CONFIGURE: '{{ joinPath .TASKFILE_DIR .BUILD_DIR "sqlcipher" "configure" }}'
+      BUILD_OUTPUT_PATH: '{{ joinPath .TASKFILE_DIR .BUILD_DIR "bld" }}'
+    cmds:
+      - cmd: |
+          mkdir -p "{{ fromSlash .BUILD_OUTPUT_PATH }}"
+          cd "{{ fromSlash .BUILD_OUTPUT_PATH }}"
+          "{{ fromSlash .CONFIGURE }}" \
+            --enable-tempstore=yes CFLAGS=-DSQLITE_HAS_CODEC
+
+  sqlcipher-compile:
+    deps: [sqlcipher-configure]
+    preconditions:
+      - test -d "{{.BUILD_DIR}}/bld"
+    sources:
+      - '{{.BUILD_DIR}}/bld/Makefile'
+      - '{{.BUILD_DIR}}/sqlcipher/**/*.c'
+      - '{{.BUILD_DIR}}/sqlcipher/**/*.h'
+    generates:
+      - '{{.BUILD_DIR}}/bld/sqlite3.c'
+      - '{{.BUILD_DIR}}/bld/sqlite3.h'
+    cmds:
+      - cmd: |
+          cd "{{ joinPath .TASKFILE_DIR .BUILD_DIR "bld" }}"
+          make sqlite3.c
+
+  goreleaser-install:
+    deps: [goreleaser-install-brew]
+    desc: Install goreleaser
+    preconditions:
+      - go version
+    status:
+      - goreleaser --version
+    cmds:
+      - cmd: go install github.com/goreleaser/goreleaser@latest
+
+  goreleaser-install-brew:
+    internal: true
+    desc: Install goreleaser using brew
+    platforms: [darwin, linux]
+    status:
+      - 'goreleaser --version'
+    cmds:
+      - cmd: brew install goreleaser/tap/goreleaser
+
+  scoop-install:
+    desc: Install libraries with scoop
+    status:
+      - 'scoop --version'
+    cmds:
+      - cmd: pwsh -NoProfile -Command 'iex "& {$(irm get.scoop.sh)} -RunAsAdmin"'
+        platforms: [windows]
+        ignore_error: true
+      - cmd: pwsh -NoProfile -Command 'Join-Path (Resolve-Path ~).Path "scoop/shims" >> $Env:GITHUB_PATH'
+        platforms: [windows]
+        ignore_error: true
+
+  git-submodule-init:
+    sources:
+      - .gitmodules
+    generates:
+      - '{{.BUILD_DIR}}/logs/git-submodule-init.log'
+    cmds:
+      - cmd: |
+          git -C "{{.TASKFILE_DIR}}" submodule update --init --recursive
+      - cmd: |
+          mkdir -p {{.BUILD_DIR}}/logs
+          touch {{.BUILD_DIR}}/logs/git-submodule-init.log
+
+  vcpkg-integrate:
+    deps: [vcpkg-download]
+    internal: true
+    cmds:
+      - cmd: '{{.RUN}} "{{ fromSlash .VCPKG_EXE }}" integrate install'
+
+  vcpkg-download:
+    deps: [git-submodule-init]
+    status:
+      - test -f "{{.VCPKG_EXE}}"
+    cmds:
+      - cmd: '{{.RUN}} "{{ fromSlash .VCPKG_BOOTSTRAP_BAT }}" -disableMetrics'
+
+  delete:
+    internal: true
+    requires: { vars: [TARGET_DIR] }
+    status:
+      - test ! -e "{{.TARGET_DIR}}"
+    cmds:
+      - cmd: |
+          {{.RUN}} if exist "{{.TARGET_DIR}}" rmdir /s /q "{{.TARGET_DIR}}"
+        platforms: [windows]
+      - cmd: |
+          rm -rf "{{.TARGET_DIR}}"
+        platforms: [linux, darwin]
